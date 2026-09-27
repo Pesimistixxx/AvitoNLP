@@ -1,28 +1,64 @@
+# Avito NLP Candidate Generation
+Гибридная система кандидатогенерации для поиска услуг Авито. Для каждого
+benchmark-запроса решение возвращает 50 уникальных `item_id`.
+
+## Архитектура
+
+```mermaid
+flowchart LR
+    Q[Запрос] --> N[Нормализация]
+    N --> B[BM25]
+    N --> C[Char TF-IDF]
+    N --> D[MiniLM cosine]
+    B --> R[RRF]
+    C --> R
+    D --> R
+    T[Train clicks] --> H[Точная история]
+    T --> M[Query to microcat]
+    M --> S[Мягкий microcat boost]
     R --> S
-    S --> O[50 item_id]
+    S --> K[Квота 35 local]
+    K --> U[Квота 48 services]
+    H --> U
+    U --> O[50 unique item_id]
 ```
 
-### Построение индексов
+### Поисковые каналы
 
-`CandidateModel.fit()`:
+| Канал | Текст объявления | Задача |
+|---|---|---|
+| BM25 | `title × 2 + params + 300 символов description` | Точные термины и фразы |
+| Char TF-IDF | `title + params` | Опечатки и морфология |
+| MiniLM | `title + params` | Семантически близкие формулировки |
 
-1. Нормализует текстовые поля.
-2. Строит BM25 по `title + params + description`.
-3. Строит character TF-IDF по `title + params`.
-4. Считает MiniLM-эмбеддинги по `title + params`.
-5. Собирает статистику кликов по паре `search_query + search_location_id`.
+Используется open-source модель
+[`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2).
+Она не дообучается. MiniLM выбрана вместо BGE-M3, потому что быстрее и
+требует меньше памяти, что важно для локального CPU-запуска.
 
-MiniLM не дообучается: используется готовая open-source модель [`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2).
+### Предсказание микрокатегории
 
-### Инференс
+1. Из train собираются три наиболее частые `item_microcat_id` каждого запроса.
+2. Для точного повтора benchmark-запроса берутся его train-микрокатегории.
+3. Для нового запроса ищутся 20 ближайших train-запросов по char TF-IDF.
+4. Их голоса суммируются с учётом similarity.
+5. Кандидаты трёх лучших микрокатегорий получают множители `1.45`, `1.25` и `1.10`.
 
-`CandidateModel.predict()`:
+Используется мягкое усиление, а не фильтр: ошибка предсказания не должна
+удалить релевантное объявление из топа.
 
-1. Получает до 150 кандидатов от каждого поискового канала.
-2. Добавляет локальные результаты, если запрос не связан с доставкой.
-3. Объединяет ранги через RRF.
-4. Добавляет до 15 объявлений из точной истории запроса и локации.
-5. Удаляет повторы и возвращает 50 `item_id`.
+### Квоты
+
+Финальный отбор идёт по шагам:
+
+1. До 10 точных исторических кликов.
+2. До 35 локальных объявлений из категории услуг.
+3. Не менее 48 объявлений `item_category_id == 114`.
+4. Дозаполнение до 50 лучшими глобальными кандидатами.
+
+Категория услуг имеет приоритет над локацией: если в локации нет 35 услуг,
+локальная квота может быть недобрана. Два глобальных fallback-места страхуют
+редкие положительные примеры других категорий.
 
 ## Структура проекта
 
@@ -30,7 +66,6 @@ MiniLM не дообучается: используется готовая open
 .
 ├── app/
 │   ├── data_io/
-│   │   ├── __init__.py
 │   │   └── data_io.py
 │   └── model/
 │       ├── __init__.py
@@ -39,20 +74,16 @@ MiniLM не дообучается: используется готовая open
 │   ├── train.parquet
 │   ├── benchmark_queries.parquet
 │   └── benchmark_items.parquet
-├── artifacts/                  # модель и кеш эмбеддингов
-├── output/                     # answer.csv
+├── artifacts/
+├── output/
 ├── config.py
 ├── main.py
 ├── requirements.txt
 ├── Dockerfile
-└── .dockerignore
+└── README.md
 ```
 
-`config.py` определяет каталоги входных и выходных данных. `main.py` запускает весь pipeline: загрузка → построение индексов → инференс → сохранение `answer.csv`.
-
 ## Локальный запуск
-
-Требуется Python 3.12.
 
 ```bash
 python3.12 -m venv .venv
@@ -61,19 +92,19 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-Перед запуском нужно положить три Parquet-файла в `data/`. Первый запуск скачает MiniLM и рассчитает эмбеддинги всех объявлений.
+Первый запуск скачивает MiniLM. После этого модель сначала загружается из
+локального кеша без сетевых запросов. Для строго offline-режима можно изменить
+создание модели:
 
-## Запуск в Docker
+```python
+model = CandidateModel(local_files_only=True)
+```
 
-Собрать образ:
+## Запуск Docker
 
 ```bash
 docker build -t avito-nlp .
-```
 
-Запустить pipeline:
-
-```bash
 mkdir -p output artifacts
 
 docker run --rm \
@@ -83,40 +114,31 @@ docker run --rm \
   avito-nlp
 ```
 
-Данные не копируются в Docker-образ. Каталоги `data`, `output` и `artifacts` подключаются как volumes.
+В Docker каталог `artifacts` обязательно нужно монтировать как volume. Иначе кеш
+будет потерян после завершения контейнера.
 
 ## Кеш
 
-После первого запуска в `artifacts/` появятся:
-
 ```text
 artifacts/
-├── huggingface/                        # файлы MiniLM
-├── item_embeddings_<model_hash>.npy  # эмбеддинги корпуса
-└── item_embeddings_<model_hash>.json # fingerprint данных
+├── huggingface/
+├── item_embeddings_f9fc7e6f31.npy
+└── item_embeddings_f9fc7e6f31.json
 ```
 
-Если модель и тексты объявлений не изменились, эмбеддинги загружаются из кеша через memory mapping. При изменении модели, `item_id` или текстов fingerprint изменится, и кеш будет пересчитан. BM25 и TF-IDF пока строятся заново при каждом запуске.
+V2 использует тот же MiniLM-текст `title + params`, что и baseline 0.54, поэтому
+существующая матрица эмбеддингов переиспользуется. Fingerprint меняется, если
+изменится модель, порядок `item_id` или dense-тексты. BM25, char TF-IDF и индекс
+train-запросов пока строятся заново при каждом запуске.
 
 ## Результат
 
-После запуска создаётся `output/answer.csv`:
+После запуска создаётся `output/answer.csv` с двумя колонками:
 
 ```csv
 query_id,answer
 00WuFMaXSFZBxSzT,1382564bf8994a83 121fa7f5e765ce00
 ```
 
-Файл содержит ровно две колонки:
-
-- `query_id` — идентификатор запроса;
-- `answer` — до 50 уникальных `item_id`, разделённых пробелом.
-
-## Используемые инструменты
-
-- pandas и PyArrow — загрузка Parquet и сохранение CSV;
-- scikit-learn — CountVectorizer и character TF-IDF;
-- NumPy/SciPy — матричные операции и разреженные индексы;
-- Sentence Transformers — локальный запус multilingual MiniLM.
-
-Внешние API во время инференса не используются. Доступ к интернету нужен только для первичного скачивания open-source модели.
+- `query_id` — идентификатор benchmark-запроса;
+- `answer` — 50 уникальных `item_id`, разделённых пробелами.
