@@ -1,8 +1,9 @@
-"""Гибридная кандидатогенерация V4 для поиска услуг Авито.
+"""Гибридная кандидатогенерация V5 для поиска услуг Авито.
 
 Версия объединяет пять независимых текстовых каналов, географический
 поиск по координатам, статистику query/filter -> microcat, query profile по
 историческим кликам и точное совпадение поисковых фильтров с параметрами.
+Дополнительный Naive Bayes обобщает связь текста запроса с микрокатегорией.
 Финальные 50 кандидатов выбираются с квотами, потому что Recall@50 зависит
 от покрытия, а не от порядка внутри ответа.
 
@@ -23,6 +24,7 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
 
 
 LOGGER = logging.getLogger(__name__)
@@ -92,6 +94,8 @@ class CandidateModel:
         profile_quota: int = 6,
         quality_weight: float = 0.002,
         geo_weight: float = 0.001,
+        use_nb_microcats: bool = True,
+        skip_zero_scores: bool = True,
     ) -> None:
         """Задать параметры кандидатогенерации.
 
@@ -110,6 +114,8 @@ class CandidateModel:
             profile_quota: Квота кандидатов query-profile канала.
             quality_weight: Вес сглаженного prior качества объявления.
             geo_weight: Дополнительный вес близости внутри geo-пула.
+            use_nb_microcats: Добавлять обучаемый прогноз микрокатегорий.
+            skip_zero_scores: Не включать нулевые совпадения в RRF-каналы.
 
         Raises:
             ValueError: Если квоты несовместимы с размером результата.
@@ -137,6 +143,8 @@ class CandidateModel:
         self.geo_max_quota = geo_max_quota
         self.filter_quota = filter_quota
         self.profile_quota = profile_quota
+        self.use_nb_microcats = use_nb_microcats
+        self.skip_zero_scores = skip_zero_scores
         self.quality_weight = quality_weight
         self.geo_weight = geo_weight
         self.is_fitted = False
@@ -157,6 +165,21 @@ class CandidateModel:
             return np.empty(0, dtype=np.int64)
         positions = np.argpartition(scores, len(scores) - count)[-count:]
         return positions[np.argsort(scores[positions])[::-1]]
+
+    def _channel_top_indices(self, scores: np.ndarray, count: int) -> np.ndarray:
+        """Оставить лучшие объявления с ненулевым свидетельством канала.
+
+        Args:
+            scores: Оценки одного канала по рассматриваемому пулу.
+            count: Максимальная глубина канала.
+
+        Returns:
+            Индексы с положительной оценкой; при отключённой опции поведение V4.
+        """
+        positions = self._top_indices(scores, count)
+        if self.skip_zero_scores:
+            positions = positions[scores[positions] > 0]
+        return positions
 
     @staticmethod
     def _positions_by_value(values: np.ndarray) -> dict[int, np.ndarray]:
@@ -334,6 +357,41 @@ class CandidateModel:
             self.reference_queries
         )
 
+    def _fit_microcat_classifier(self, train: pd.DataFrame) -> None:
+        """Выучить связь текста запроса и фильтра с микрокатегорией клика.
+
+        Args:
+            train: Нормализованные положительные пары train.
+
+        Returns:
+            `None`. Сохраняет TF-IDF словарь и MultinomialNB.
+        """
+        # Повторный клик по той же паре не должен искусственно делать
+        # микрокатегорию более вероятной для этого запроса.
+        pairs = train.drop_duplicates(
+            ["normalized_query", "normalized_filter", "item_id"]
+        )
+        texts = (
+            pairs["normalized_query"] + " " + pairs["normalized_filter"]
+        ).tolist()
+        self.microcat_vectorizer = TfidfVectorizer(
+            analyzer="char_wb",
+            ngram_range=(3, 5),
+            min_df=3,
+            max_features=120_000,
+            sublinear_tf=True,
+            dtype=np.float32,
+        )
+        matrix = self.microcat_vectorizer.fit_transform(texts)
+        self.microcat_classifier = MultinomialNB(alpha=0.2)
+        self.microcat_classifier.fit(
+            matrix, pairs["item_microcat_id"].to_numpy()
+        )
+        LOGGER.info(
+            "Обучен Naive Bayes для %d микрокатегорий",
+            len(self.microcat_classifier.classes_),
+        )
+
     def _fit_query_profiles(
         self,
         normalized_train: pd.DataFrame,
@@ -417,6 +475,15 @@ class CandidateModel:
             Списки `(microcat, probability)` и тексты query profile.
         """
         query_matrix = self.query_vectorizer.transform(query_texts)
+        nb_probabilities: np.ndarray | None = None
+        if self.use_nb_microcats:
+            texts = [
+                f"{query} {query_filter}"
+                for query, query_filter in zip(query_texts, filter_texts)
+            ]
+            nb_probabilities = self.microcat_classifier.predict_proba(
+                self.microcat_vectorizer.transform(texts)
+            )
         predictions: list[list[tuple[int, float]]] = []
         profile_queries: list[str] = []
 
@@ -426,10 +493,12 @@ class CandidateModel:
                 query_matrix[start:stop] @ self.reference_query_matrix.T
             ).toarray()
 
-            for query, query_filter, row in zip(
-                query_texts[start:stop],
-                filter_texts[start:stop],
-                similarities,
+            for local_index, (query, query_filter, row) in enumerate(
+                zip(
+                    query_texts[start:stop],
+                    filter_texts[start:stop],
+                    similarities,
+                )
             ):
                 scores: defaultdict[int, float] = defaultdict(float)
                 neighbours = np.empty(0, dtype=np.int64)
@@ -441,6 +510,7 @@ class CandidateModel:
                     self._add_probability_evidence(scores, exact_pair, weight=3.0)
 
                 query_evidence = self.query_microcats.get(str(query))
+                unseen_query = query_evidence is None
                 if query_evidence is None:
                     neighbours = self._top_indices(row, min(20, len(row)))
                     neighbour_votes: defaultdict[int, float] = defaultdict(float)
@@ -461,6 +531,25 @@ class CandidateModel:
 
                 best = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)[:5]
                 total = sum(score for _, score in best)
+                if nb_probabilities is not None:
+                    # NB особенно полезен для новых формулировок. Для уже
+                    # известного запроса оставляем больший вес точной истории.
+                    fused = (
+                        {microcat: score / total for microcat, score in best}
+                        if total > 0 else {}
+                    )
+                    nb_row = nb_probabilities[start + local_index]
+                    nb_top = self._top_indices(nb_row, 8)
+                    nb_weight = 0.5 if unseen_query else 0.2
+                    for index in nb_top:
+                        microcat = int(self.microcat_classifier.classes_[index])
+                        fused[microcat] = fused.get(microcat, 0.0) + (
+                            nb_weight * float(nb_row[index])
+                        )
+                    best = sorted(
+                        fused.items(), key=lambda pair: pair[1], reverse=True
+                    )[:8]
+                    total = sum(score for _, score in best)
                 predictions.append(
                     [
                         (microcat, score / total)
@@ -900,6 +989,7 @@ class CandidateModel:
             normalized_train["search_infm_params_text"]
         )
         self._fit_query_knowledge(normalized_train)
+        self._fit_microcat_classifier(normalized_train)
         self._fit_query_profiles(normalized_train, train)
         self._fit_geography(normalized_train)
 
@@ -1315,7 +1405,9 @@ class CandidateModel:
                     channel_scores += ((profile_scores[offset], 1.00),)
 
                 for scores, weight in channel_scores:
-                    ranked = self._top_indices(scores, self.channel_candidates)
+                    ranked = self._channel_top_indices(
+                        scores, self.channel_candidates
+                    )
                     self._add_rrf(fused, ranked, weight)
 
                 row = queries.iloc[query_index]
@@ -1324,7 +1416,7 @@ class CandidateModel:
                     str(filters[query_index])
                 )
                 if has_profile[query_index]:
-                    profile_positions = self._top_indices(
+                    profile_positions = self._channel_top_indices(
                         profile_scores[offset], self.channel_candidates
                     )
                     profile_positions = profile_positions[
@@ -1338,7 +1430,7 @@ class CandidateModel:
                 # при широком фильтре квота выбирала бы объявления почти только
                 # по популярности, а не по тексту запроса.
                 for scores, weight in channel_scores:
-                    filter_rank = self._top_indices(
+                    filter_rank = self._channel_top_indices(
                         scores[filter_positions],
                         min(self.channel_candidates, len(filter_positions)),
                     )
@@ -1352,7 +1444,7 @@ class CandidateModel:
                 if not bool(row["search_is_delivery_search"]):
                     geo_positions, proximity = self._geo_candidates(location)
                     for scores, weight in channel_scores:
-                        geo_rank = self._top_indices(
+                        geo_rank = self._channel_top_indices(
                             scores[geo_positions],
                             min(self.channel_candidates, len(geo_positions)),
                         )
