@@ -1,15 +1,12 @@
-"""Гибридная модель кандидатогенерации для поиска услуг Авито.
+"""Гибридная кандидатогенерация V3 для поиска услуг Авито.
 
-Модель объединяет BM25, character TF-IDF и dense-поиск MiniLM. Ранги
-каналов сводятся через Reciprocal Rank Fusion (RRF), после чего к ним
-добавляются три сигнала из данных:
+Версия объединяет пять независимых текстовых каналов, географический
+поиск по координатам, статистику query/filter -> microcat и слабые признаки
+качества объявления. Финальные 50 кандидатов выбираются с квотами, потому
+что Recall@50 зависит от покрытия, а не от порядка внутри ответа.
 
-* точная история кликов по паре `query + location`;
-* мягкое усиление предсказанных `item_microcat_id`;
-* квоты по локации и категории услуг.
-
-Модель MiniLM не дообучается. `fit()` строит поисковые индексы,
-статистику кликов и маппинг запросов на микрокатегории.
+MiniLM не дообучается. `fit()` строит разреженные индексы, статистику
+кликов и географические центры; эмбеддинги объявлений кешируются на диске.
 """
 
 from __future__ import annotations
@@ -22,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.sparse import csr_matrix
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 
@@ -30,19 +28,18 @@ LOGGER = logging.getLogger(__name__)
 
 
 class Normalizer:
-    """Готовит текст для лексического и нейросетевого поиска."""
+    """Подготавливает текст для лексического и нейросетевого поиска."""
 
     @staticmethod
     def lexical(values: pd.Series, limit: int | None = None) -> np.ndarray:
         """Нормализовать серию текстов для BM25 и TF-IDF.
 
         Args:
-            values: Серия со строками; NaN заменяются пустыми строками.
-            limit: Максимальное число символов. `None` не ограничивает длину.
+            values: Серия со строками; пропуски заменяются пустыми строками.
+            limit: Максимальное число исходных символов. `None` не обрезает текст.
 
         Returns:
-            NumPy-массив строк в нижнем регистре, без пунктуации и
-            повторных пробелов.
+            NumPy-массив строк в нижнем регистре без пунктуации и лишних пробелов.
         """
         text = values.fillna("").astype(str)
         if limit is not None:
@@ -61,8 +58,8 @@ class Normalizer:
         """Подготовить текст для MiniLM без агрессивной нормализации.
 
         Args:
-            values: Серия со строками; NaN заменяются пустыми строками.
-            limit: Максимальное число символов. `None` не ограничивает длину.
+            values: Серия со строками; пропуски заменяются пустыми строками.
+            limit: Максимальное число исходных символов. `None` не обрезает текст.
 
         Returns:
             NumPy-массив строк без повторных пробелов.
@@ -74,7 +71,7 @@ class Normalizer:
 
 
 class CandidateModel:
-    """Гибридная модель поиска с мягкими бизнес-ограничениями."""
+    """Гибридная модель поиска с microcat- и geo-квотами."""
 
     def __init__(
         self,
@@ -86,34 +83,38 @@ class CandidateModel:
         embedding_batch_size: int = 64,
         channel_candidates: int = 150,
         result_max_size: int = 50,
-        local_quota: int = 35,
         service_category_id: int = 114,
-        service_quota: int = 48,
-        history_limit: int = 10,
+        history_limit: int = 8,
+        geo_min_quota: int = 32,
+        geo_max_quota: int = 45,
+        quality_weight: float = 0.002,
+        geo_weight: float = 0.001,
     ) -> None:
         """Задать параметры кандидатогенерации.
 
         Args:
-            model_name_or_path: Имя Hugging Face-модели или путь к локальной копии.
+            model_name_or_path: Имя Hugging Face-модели или локальный путь.
             artifacts_dir: Каталог модели и кеша эмбеддингов.
-            local_files_only: Если `True`, запретить скачивание MiniLM.
-                При `False` модель сначала тоже ищется в локальном кеше
-                и скачивается только при её отсутствии.
+            local_files_only: Запретить скачивание MiniLM при отсутствии кеша.
             embedding_batch_size: Число текстов в одном батче MiniLM.
-            channel_candidates: Глубина списка каждого поискового канала.
-            result_max_size: Максимальное число `item_id` в ответе.
-            local_quota: Целевое число кандидатов из локации запроса.
-            service_category_id: ID категории услуг. В этом датасете это `114`.
-            service_quota: Целевое число кандидатов категории услуг.
+            channel_candidates: Глубина ранжированного списка каждого канала.
+            result_max_size: Число кандидатов в финальном ответе.
+            service_category_id: Категория услуг; в данных задачи это `114`.
             history_limit: Максимум точных исторических кандидатов.
+            geo_min_quota: Минимальная квота географически близких объявлений.
+            geo_max_quota: Максимальная квота географически близких объявлений.
+            quality_weight: Вес сглаженного prior качества объявления.
+            geo_weight: Дополнительный вес близости внутри geo-пула.
 
         Raises:
-            ValueError: Если квоты отрицательны или больше `result_max_size`.
+            ValueError: Если квоты несовместимы с размером результата.
         """
-        if not 0 <= local_quota <= result_max_size:
-            raise ValueError("local_quota должна быть в диапазоне [0, result_max_size]")
-        if not 0 <= service_quota <= result_max_size:
-            raise ValueError("service_quota должна быть в диапазоне [0, result_max_size]")
+        if not 0 <= geo_min_quota <= geo_max_quota <= result_max_size:
+            raise ValueError(
+                "Ожидается 0 <= geo_min_quota <= geo_max_quota <= result_max_size"
+            )
+        if result_max_size <= 0:
+            raise ValueError("result_max_size должен быть положительным")
 
         self.model_name_or_path = model_name_or_path
         self.artifacts_dir = Path(artifacts_dir)
@@ -121,10 +122,12 @@ class CandidateModel:
         self.embedding_batch_size = embedding_batch_size
         self.channel_candidates = channel_candidates
         self.result_max_size = result_max_size
-        self.local_quota = local_quota
         self.service_category_id = service_category_id
-        self.service_quota = service_quota
         self.history_limit = history_limit
+        self.geo_min_quota = geo_min_quota
+        self.geo_max_quota = geo_max_quota
+        self.quality_weight = quality_weight
+        self.geo_weight = geo_weight
         self.is_fitted = False
 
     @staticmethod
@@ -149,7 +152,7 @@ class CandidateModel:
         """Сгруппировать позиции массива по целочисленному значению.
 
         Args:
-            values: Например, `item_location_id` или `item_microcat_id`.
+            values: Например, массив `item_location_id` или `item_microcat_id`.
 
         Returns:
             Словарь `{value: positions}`.
@@ -169,13 +172,13 @@ class CandidateModel:
         weight: float,
         rrf_k: int = 60,
     ) -> None:
-        """Добавить ранжированный список в RRF-оценки.
+        """Добавить ранжированный список в общие RRF-оценки.
 
         Args:
             fused_scores: Общие оценки, изменяемые на месте.
-            ranked_indices: Индексы от лучшего к худшему.
+            ranked_indices: Позиции объявлений от лучшего к худшему.
             weight: Вес поискового канала.
-            rrf_k: Сглаживающая константа.
+            rrf_k: Сглаживающая константа RRF.
 
         Returns:
             `None`.
@@ -190,38 +193,44 @@ class CandidateModel:
         Args:
             data: Проверяемый DataFrame.
             required: Множество обязательных колонок.
-            name: Имя таблицы для текста ошибки.
+            name: Имя таблицы для сообщения об ошибке.
 
         Returns:
             `None`.
 
         Raises:
-            ValueError: Если одна из колонок отсутствует.
+            ValueError: Если одна из обязательных колонок отсутствует.
         """
         missing = required.difference(data.columns)
         if missing:
             raise ValueError(f"В {name} нет колонок: {sorted(missing)}")
 
-    def _fit_bm25(self, documents: list[str]) -> None:
-        """Построить разреженную BM25-матрицу без отдельной зависимости.
+    @staticmethod
+    def _build_bm25(
+        documents: list[str],
+        ngram_range: tuple[int, int],
+        max_features: int,
+    ) -> tuple[CountVectorizer, csr_matrix]:
+        """Построить BM25-матрицу средствами scikit-learn.
 
         Args:
-            documents: Нормализованные тексты объявлений.
+            documents: Нормализованные документы одного поля.
+            ngram_range: Диапазон словных n-грамм.
+            max_features: Максимальный размер словаря.
 
         Returns:
-            `None`. Создаёт `bm25_vectorizer` и `item_bm25`.
+            Обученный `CountVectorizer` и BM25-взвешенная CSR-матрица.
         """
-        self.bm25_vectorizer = CountVectorizer(
-            ngram_range=(1, 2),
+        vectorizer = CountVectorizer(
+            ngram_range=ngram_range,
             min_df=2,
-            max_features=150_000,
+            max_features=max_features,
             token_pattern=r"(?u)\b\w+\b",
             dtype=np.float32,
         )
-        counts = self.bm25_vectorizer.fit_transform(documents).tocsr()
+        counts = vectorizer.fit_transform(documents).tocsr()
         document_lengths = np.asarray(counts.sum(axis=1)).ravel()
         average_length = max(float(document_lengths.mean()), 1.0)
-
         document_frequency = np.diff(counts.tocsc().indptr)
         idf = np.log1p(
             (counts.shape[0] - document_frequency + 0.5)
@@ -238,49 +247,70 @@ class CandidateModel:
             * (k1 + 1.0)
             / (term_frequency + repeated_norm)
         ).astype(np.float32)
-        self.item_bm25 = counts
+        return vectorizer, counts
 
-    def _fit_query_knowledge(self, train: pd.DataFrame) -> None:
-        """Построить маппинг train-запросов на микрокатегории.
+    @staticmethod
+    def _top_microcat_map(
+        train: pd.DataFrame,
+        keys: list[str],
+        limit: int,
+    ) -> dict[object, list[tuple[int, int]]]:
+        """Собрать частотный microcat-маппинг для заданного ключа.
 
         Args:
-            train: Таблица кликов с нормализованным `normalized_query`.
+            train: Нормализованные положительные пары train.
+            keys: Колонки ключа, например query или query + filter.
+            limit: Максимум микрокатегорий для одного ключа.
 
         Returns:
-            `None`. Создаёт `query_microcats`, `reference_queries` и
-            char TF-IDF-индекс train-запросов.
+            Словарь с парами `(item_microcat_id, unique_item_count)`.
         """
-        # Один item может встречаться в train много раз. Дедупликация не даёт
-        # одному популярному объявлению полностью определить микрокатегорию.
-        unique_pairs = train.drop_duplicates(["normalized_query", "item_id"])
-        microcat_counts = (
-            unique_pairs.groupby(["normalized_query", "item_microcat_id"])
+        unique_pairs = train.drop_duplicates(keys + ["item_id"])
+        counts = (
+            unique_pairs.groupby(keys + ["item_microcat_id"])
             .size()
             .rename("count")
             .reset_index()
-            .sort_values(
-                ["normalized_query", "count"], ascending=[True, False]
-            )
-            .groupby("normalized_query", sort=False)
-            .head(3)
+            .sort_values(keys + ["count"], ascending=[True] * len(keys) + [False])
+            .groupby(keys, sort=False)
+            .head(limit)
         )
-        self.query_microcats = {
-            query: list(
+
+        result: dict[object, list[tuple[int, int]]] = {}
+        group_key: str | list[str] = keys[0] if len(keys) == 1 else keys
+        for key, group in counts.groupby(group_key, sort=False):
+            result[key] = list(
                 zip(
                     group["item_microcat_id"].astype(int),
                     group["count"].astype(int),
                 )
             )
-            for query, group in microcat_counts.groupby(
-                "normalized_query", sort=False
-            )
-        }
+        return result
 
-        # Character n-граммы устойчивы к опечаткам и формам русских слов, поэтому ими
-        # ищем похожий train-запрос, когда точного совпадения нет.
-        self.reference_queries = np.asarray(
-            list(self.query_microcats), dtype=object
+    def _fit_query_knowledge(self, train: pd.DataFrame) -> None:
+        """Построить query/filter-маппинги и индекс похожих запросов.
+
+        Args:
+            train: Таблица с `normalized_query` и `normalized_filter`.
+
+        Returns:
+            `None`. Сохраняет статистику микрокатегорий и char TF-IDF-индекс.
+        """
+        self.query_microcats = self._top_microcat_map(
+            train, ["normalized_query"], limit=5
         )
+        nonempty_filters = train[train["normalized_filter"].ne("")]
+        self.filter_microcats = self._top_microcat_map(
+            nonempty_filters, ["normalized_filter"], limit=10
+        )
+        self.query_filter_microcats = self._top_microcat_map(
+            nonempty_filters,
+            ["normalized_query", "normalized_filter"],
+            limit=5,
+        )
+
+        # Character n-граммы устойчивы к опечаткам и русской морфологии.
+        self.reference_queries = np.asarray(list(self.query_microcats), dtype=object)
         self.query_vectorizer = TfidfVectorizer(
             analyzer="char_wb",
             ngram_range=(3, 5),
@@ -293,17 +323,44 @@ class CandidateModel:
             self.reference_queries
         )
 
-    def _predict_microcats(self, query_texts: np.ndarray) -> list[list[int]]:
-        """Предсказать до трёх микрокатегорий для каждого запроса.
+    @staticmethod
+    def _add_probability_evidence(
+        scores: defaultdict[int, float],
+        evidence: list[tuple[int, float]],
+        weight: float,
+    ) -> None:
+        """Добавить нормированное microcat-свидетельство.
+
+        Args:
+            scores: Накопленные оценки, изменяемые на месте.
+            evidence: Пары `(microcat, confidence)`.
+            weight: Доверие к источнику.
+
+        Returns:
+            `None`.
+        """
+        total = sum(value for _, value in evidence)
+        if total <= 0:
+            return
+        for microcat, value in evidence:
+            scores[int(microcat)] += weight * float(value) / total
+
+    def _predict_microcats(
+        self,
+        query_texts: np.ndarray,
+        filter_texts: np.ndarray,
+    ) -> list[list[tuple[int, float]]]:
+        """Предсказать до пяти микрокатегорий по запросу и фильтрам.
 
         Args:
             query_texts: Нормализованные benchmark-запросы.
+            filter_texts: Нормализованные поисковые фильтры.
 
         Returns:
-            Список микрокатегорий для каждого запроса.
+            Для каждого запроса список `(microcat, probability)`.
         """
         query_matrix = self.query_vectorizer.transform(query_texts)
-        predictions: list[list[int]] = []
+        predictions: list[list[tuple[int, float]]] = []
 
         for start in range(0, len(query_texts), 64):
             stop = min(start + 64, len(query_texts))
@@ -311,36 +368,191 @@ class CandidateModel:
                 query_matrix[start:stop] @ self.reference_query_matrix.T
             ).toarray()
 
-            for query, row in zip(query_texts[start:stop], similarities):
-                # Точный train-запрос надёжнее поиска соседей.
-                exact = self.query_microcats.get(str(query))
-                if exact is not None:
-                    predictions.append([microcat for microcat, _ in exact])
-                    continue
+            for query, query_filter, row in zip(
+                query_texts[start:stop],
+                filter_texts[start:stop],
+                similarities,
+            ):
+                scores: defaultdict[int, float] = defaultdict(float)
 
-                neighbours = self._top_indices(row, min(20, len(row)))
-                votes: defaultdict[int, float] = defaultdict(float)
-                for neighbour in neighbours:
-                    similarity = float(row[neighbour])
-                    if similarity <= 0:
-                        continue
-                    reference_query = self.reference_queries[neighbour]
-                    for microcat, count in self.query_microcats[reference_query]:
-                        # sqrt не позволяет очень частому train-запросу подавить всех соседей.
-                        votes[microcat] += similarity * float(np.sqrt(count))
+                exact_pair = self.query_filter_microcats.get(
+                    (str(query), str(query_filter))
+                )
+                if exact_pair is not None:
+                    self._add_probability_evidence(scores, exact_pair, weight=3.0)
 
+                query_evidence = self.query_microcats.get(str(query))
+                if query_evidence is None:
+                    neighbours = self._top_indices(row, min(20, len(row)))
+                    neighbour_votes: defaultdict[int, float] = defaultdict(float)
+                    for neighbour in neighbours:
+                        similarity = float(row[neighbour])
+                        if similarity <= 0:
+                            continue
+                        reference = self.reference_queries[neighbour]
+                        for microcat, count in self.query_microcats[reference]:
+                            neighbour_votes[microcat] += similarity * float(
+                                np.sqrt(count)
+                            )
+                    query_evidence = list(neighbour_votes.items())
+
+                self._add_probability_evidence(scores, query_evidence, weight=2.0)
+                filter_evidence = self.filter_microcats.get(str(query_filter), [])
+                self._add_probability_evidence(scores, filter_evidence, weight=1.5)
+
+                best = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)[:5]
+                total = sum(score for _, score in best)
                 predictions.append(
-                    sorted(votes, key=votes.get, reverse=True)[:3]
+                    [
+                        (microcat, score / total)
+                        for microcat, score in best
+                    ]
+                    if total > 0
+                    else []
                 )
 
         return predictions
+
+    @staticmethod
+    def _haversine_km(
+        center_latitude: float,
+        center_longitude: float,
+        latitudes: np.ndarray,
+        longitudes: np.ndarray,
+    ) -> np.ndarray:
+        """Рассчитать расстояние от центра до массива координат.
+
+        Args:
+            center_latitude: Широта центра в градусах.
+            center_longitude: Долгота центра в градусах.
+            latitudes: Широты объявлений в градусах.
+            longitudes: Долготы объявлений в градусах.
+
+        Returns:
+            Расстояния в километрах; невалидные координаты остаются `NaN`.
+        """
+        center_lat = np.radians(center_latitude)
+        center_lon = np.radians(center_longitude)
+        item_lat = np.radians(latitudes)
+        item_lon = np.radians(longitudes)
+        value = (
+            np.sin((item_lat - center_lat) / 2.0) ** 2
+            + np.cos(center_lat)
+            * np.cos(item_lat)
+            * np.sin((item_lon - center_lon) / 2.0) ** 2
+        )
+        return (12_742.0 * np.arcsin(np.minimum(1.0, np.sqrt(value)))).astype(
+            np.float32
+        )
+
+    def _fit_geography(self, train: pd.DataFrame) -> None:
+        """Оценить центры поисковых локаций и локальность микрокатегорий.
+
+        Args:
+            train: Положительные пары с координатами выбранного объявления.
+
+        Returns:
+            `None`. Создаёт центры локаций и сглаженные near-25km priors.
+        """
+        geo = train[
+            [
+                "search_location_id",
+                "item_microcat_id",
+                "item_latitude",
+                "item_longitude",
+            ]
+        ].copy()
+        geo["latitude"] = pd.to_numeric(geo["item_latitude"], errors="coerce")
+        geo["longitude"] = pd.to_numeric(geo["item_longitude"], errors="coerce")
+        valid = geo["latitude"].between(40, 82) & geo["longitude"].between(10, 190)
+        geo = geo[valid].copy()
+
+        centers = geo.groupby("search_location_id").agg(
+            latitude=("latitude", "median"),
+            longitude=("longitude", "median"),
+        )
+        self.location_centers = {
+            int(location): (float(row.latitude), float(row.longitude))
+            for location, row in centers.iterrows()
+        }
+
+        center_lat = geo["search_location_id"].map(centers["latitude"])
+        center_lon = geo["search_location_id"].map(centers["longitude"])
+        geo["near"] = self._haversine_km(
+            center_lat.to_numpy(),
+            center_lon.to_numpy(),
+            geo["latitude"].to_numpy(),
+            geo["longitude"].to_numpy(),
+        ) <= 25.0
+        self.global_near_rate = float(geo["near"].mean())
+
+        # Сглаживание не позволяет редкой локации или microcat получить квоту
+        # из нескольких случайных кликов.
+        location_stats = geo.groupby("search_location_id")["near"].agg(["sum", "count"])
+        microcat_stats = geo.groupby("item_microcat_id")["near"].agg(["sum", "count"])
+        location_prior = 100.0
+        microcat_prior = 200.0
+        self.location_near_rate = (
+            (location_stats["sum"] + location_prior * self.global_near_rate)
+            / (location_stats["count"] + location_prior)
+        ).to_dict()
+        self.microcat_near_rate = (
+            (microcat_stats["sum"] + microcat_prior * self.global_near_rate)
+            / (microcat_stats["count"] + microcat_prior)
+        ).to_dict()
+        self.geo_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _geo_candidates(self, location: int) -> tuple[np.ndarray, np.ndarray]:
+        """Вернуть сервисные объявления в адаптивном радиусе.
+
+        Args:
+            location: `search_location_id` запроса.
+
+        Returns:
+            Позиции объявлений и их proximity-score от нуля до единицы.
+        """
+        cached = self.geo_cache.get(location)
+        if cached is not None:
+            return cached
+
+        center = self.location_centers.get(location)
+        if center is None:
+            exact = self.location_positions.get(
+                location, np.empty(0, dtype=np.int64)
+            )
+            exact = exact[self.categories[exact] == self.service_category_id]
+            result = (exact, np.ones(len(exact), dtype=np.float32))
+            self.geo_cache[location] = result
+            return result
+
+        distances = self._haversine_km(
+            center[0],
+            center[1],
+            self.item_latitudes,
+            self.item_longitudes,
+        )
+        required = max(self.channel_candidates, self.result_max_size)
+        positions = np.empty(0, dtype=np.int64)
+        for radius in (25.0, 50.0, 100.0):
+            positions = np.flatnonzero(
+                (self.categories == self.service_category_id)
+                & np.isfinite(distances)
+                & (distances <= radius)
+            )
+            if len(positions) >= required:
+                break
+
+        proximity = np.exp(-distances[positions] / 25.0).astype(np.float32)
+        result = (positions, proximity)
+        self.geo_cache[location] = result
+        return result
 
     def _embedding_fingerprint(
         self,
         items: pd.DataFrame,
         dense_documents: list[str],
     ) -> str:
-        """Рассчитать fingerprint модели и текстов корпуса.
+        """Рассчитать fingerprint модели и dense-текстов корпуса.
 
         Args:
             items: Корпус с `item_id`.
@@ -351,9 +563,7 @@ class CandidateModel:
         """
         digest = hashlib.sha256(self.model_name_or_path.encode("utf-8"))
         digest.update(
-            pd.util.hash_pandas_object(
-                items["item_id"], index=False
-            ).values.tobytes()
+            pd.util.hash_pandas_object(items["item_id"], index=False).values.tobytes()
         )
         digest.update(
             pd.util.hash_pandas_object(
@@ -363,7 +573,7 @@ class CandidateModel:
         return digest.hexdigest()
 
     def _fit_dense(self, items: pd.DataFrame, dense_documents: list[str]) -> None:
-        """Загрузить MiniLM или рассчитать эмбеддинги корпуса.
+        """Загрузить MiniLM и кеш эмбеддингов или рассчитать их заново.
 
         Args:
             items: Корпус объявлений.
@@ -374,8 +584,6 @@ class CandidateModel:
         """
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         model_cache = self.artifacts_dir / "huggingface"
-        # Сначала загружаем только локальные файлы. Это убирает долгие сетевые
-        # HEAD-запросы Hugging Face при повторном или полностью offline-запуске.
         try:
             self.encoder = SentenceTransformer(
                 self.model_name_or_path,
@@ -403,7 +611,6 @@ class CandidateModel:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             if metadata.get("fingerprint") == fingerprint:
                 LOGGER.info("Загрузка кеша MiniLM: %s", embeddings_path)
-                # Memory mapping экономит оперативную память на матрице корпуса.
                 self.item_embeddings = np.load(embeddings_path, mmap_mode="r")
                 return
 
@@ -411,7 +618,6 @@ class CandidateModel:
         embeddings = self.encoder.encode(
             dense_documents,
             batch_size=self.embedding_batch_size,
-            # Для нормализованных векторов dot product равен cosine similarity.
             normalize_embeddings=True,
             convert_to_numpy=True,
             show_progress_bar=True,
@@ -422,6 +628,62 @@ class CandidateModel:
             encoding="utf-8",
         )
         self.item_embeddings = np.load(embeddings_path, mmap_mode="r")
+
+    def _build_quality_prior(
+        self,
+        train: pd.DataFrame,
+        items: pd.DataFrame,
+    ) -> np.ndarray:
+        """Построить сглаженный prior качества объявления.
+
+        Args:
+            train: Положительные пары для подсчёта исторической популярности.
+            items: Корпус объявлений.
+
+        Returns:
+            Оценка качества каждого объявления от нуля до единицы.
+        """
+        microcats = items["item_microcat_id"]
+        reviews = pd.to_numeric(
+            items["item_rating_reviews_count"], errors="coerce"
+        ).fillna(0).clip(lower=0)
+        review_percentile = reviews.groupby(microcats).rank(pct=True).to_numpy(
+            dtype=np.float32
+        )
+
+        rating = pd.to_numeric(items["item_rating"], errors="coerce")
+        valid_rating = rating.between(0, 5)
+        global_rating = float(rating[valid_rating].mean())
+        rating = rating.where(valid_rating, global_rating).fillna(global_rating)
+        bayesian_rating = (
+            (rating * reviews + global_rating * 20.0) / (reviews + 20.0) / 5.0
+        ).to_numpy(dtype=np.float32)
+
+        click_counts = train["item_id"].value_counts()
+        popularity = np.log1p(
+            items["item_id"].map(click_counts).fillna(0).to_numpy(dtype=np.float32)
+        )
+        if popularity.max() > 0:
+            popularity /= popularity.max()
+
+        price = pd.to_numeric(items["item_price"], errors="coerce").replace(-1, np.nan)
+        price_percentile = price.groupby(microcats).rank(pct=True).fillna(0.5)
+        # Внутри microcat пользователи чаще выбирали нижнюю и среднюю часть цен.
+        price_prior = (1.0 - price_percentile).to_numpy(dtype=np.float32)
+
+        contact = (
+            1.0
+            - 0.25 * items["item_is_phone_hidden"].to_numpy(dtype=np.float32)
+            - 0.40 * items["item_is_message_forbidden"].to_numpy(dtype=np.float32)
+        )
+        quality = (
+            0.45 * review_percentile
+            + 0.25 * bayesian_rating
+            + 0.15 * popularity
+            + 0.10 * contact
+            + 0.05 * price_prior
+        )
+        return np.clip(quality, 0.0, 1.0).astype(np.float32)
 
     def fit(self, train: pd.DataFrame, items: pd.DataFrame) -> "CandidateModel":
         """Построить поисковые индексы и статистику train.
@@ -434,15 +696,18 @@ class CandidateModel:
             Текущий экземпляр `CandidateModel`, готовый к `predict()`.
 
         Raises:
-            ValueError: Если нет обязательных колонок или `item_id` повторяются.
+            ValueError: Если нет колонок, `item_id` повторяются или услуг меньше 50.
         """
         self._check_columns(
             train,
             {
                 "search_query",
                 "search_location_id",
+                "search_infm_params_text",
                 "item_id",
                 "item_microcat_id",
+                "item_latitude",
+                "item_longitude",
             },
             "train",
         )
@@ -455,8 +720,14 @@ class CandidateModel:
                 "item_infm_params_text",
                 "item_category_id",
                 "item_microcat_id",
-                "item_location_id",
+                "item_price",
+                "item_rating",
                 "item_rating_reviews_count",
+                "item_location_id",
+                "item_latitude",
+                "item_longitude",
+                "item_is_phone_hidden",
+                "item_is_message_forbidden",
             },
             "items",
         )
@@ -467,49 +738,91 @@ class CandidateModel:
         self.locations = items["item_location_id"].to_numpy(dtype=np.int64)
         self.categories = items["item_category_id"].to_numpy(dtype=np.int64)
         self.microcats = items["item_microcat_id"].to_numpy(dtype=np.int64)
+        self.item_latitudes = pd.to_numeric(
+            items["item_latitude"], errors="coerce"
+        ).to_numpy(dtype=np.float64, copy=True)
+        self.item_longitudes = pd.to_numeric(
+            items["item_longitude"], errors="coerce"
+        ).to_numpy(dtype=np.float64, copy=True)
+        valid_coordinates = (
+            (self.item_latitudes >= 40)
+            & (self.item_latitudes <= 82)
+            & (self.item_longitudes >= 10)
+            & (self.item_longitudes <= 190)
+        )
+        self.item_latitudes[~valid_coordinates] = np.nan
+        self.item_longitudes[~valid_coordinates] = np.nan
+
         self.location_positions = self._positions_by_value(self.locations)
         self.microcat_positions = self._positions_by_value(self.microcats)
         self.service_positions = np.flatnonzero(
             self.categories == self.service_category_id
         )
+        if len(self.service_positions) < self.result_max_size:
+            raise ValueError("В корпусе недостаточно объявлений категории услуг")
 
-        normalized_train = train.copy()
+        # Берём только реально используемые train-поля: длинные тексты объявления
+        # уже представлены в `items`, а их копия заметно увеличивает память.
+        normalized_train = train[
+            [
+                "search_query",
+                "search_location_id",
+                "search_infm_params_text",
+                "item_id",
+                "item_microcat_id",
+                "item_latitude",
+                "item_longitude",
+            ]
+        ].copy()
         normalized_train["normalized_query"] = Normalizer.lexical(
             normalized_train["search_query"]
         )
+        normalized_train["normalized_filter"] = Normalizer.lexical(
+            normalized_train["search_infm_params_text"]
+        )
         self._fit_query_knowledge(normalized_train)
+        self._fit_geography(normalized_train)
 
         title = Normalizer.lexical(items["item_title_raw"])
-        params = Normalizer.lexical(items["item_infm_params_text"], limit=500)
-        description = Normalizer.lexical(items["item_description_raw"], limit=300)
-        # Заголовок повторяется дважды: для коротких запросов он надёжнее длинного описания.
-        lexical_documents = [
-            f"{item_title} {item_title} {item_params} {item_description}"
-            for item_title, item_params, item_description in zip(
-                title, params, description
-            )
-        ]
+        description = Normalizer.lexical(items["item_description_raw"])
+        params = Normalizer.lexical(items["item_infm_params_text"])
 
-        LOGGER.info("Построение BM25 и char TF-IDF индексов")
-        self._fit_bm25(lexical_documents)
+        # Поля индексируются отдельно: длинное описание не должно уменьшать вес
+        # точного совпадения в коротком заголовке.
+        LOGGER.info("Построение fielded BM25 индексов")
+        self.title_vectorizer, self.item_title_bm25 = self._build_bm25(
+            title.tolist(), ngram_range=(1, 2), max_features=100_000
+        )
+        self.description_vectorizer, self.item_description_bm25 = self._build_bm25(
+            description.tolist(), ngram_range=(1, 1), max_features=120_000
+        )
+        self.params_vectorizer, self.item_params_bm25 = self._build_bm25(
+            params.tolist(), ngram_range=(1, 1), max_features=100_000
+        )
+
+        # Char TF-IDF оставляем в проверенном компактном виде baseline. Полный
+        # params уже представлен отдельным BM25-каналом, поэтому повторно
+        # индексировать его character n-граммами нет смысла.
+        del description, params
+        char_params = Normalizer.lexical(items["item_infm_params_text"], limit=500)
         self.char_vectorizer = TfidfVectorizer(
             analyzer="char_wb",
             ngram_range=(3, 5),
             min_df=2,
-            max_features=150_000,
+            max_features=120_000,
             sublinear_tf=True,
             dtype=np.float32,
         )
         self.item_chars = self.char_vectorizer.fit_transform(
             [
                 f"{item_title} {item_params}"
-                for item_title, item_params in zip(title, params)
+                for item_title, item_params in zip(title, char_params)
             ]
         )
+        del title, char_params
 
-        # Dense-текст оставлен идентичным baseline 0.54: только title + params.
-        # Длинное рекламное описание не размывает смысл, а fingerprint кеша
-        # MiniLM не меняется.
+        # Dense-текст совпадает с версией 0.658719, поэтому существующий кеш
+        # MiniLM переиспользуется и повторный расчёт эмбеддингов не требуется.
         dense_title = Normalizer.dense(items["item_title_raw"])
         dense_params = Normalizer.dense(items["item_infm_params_text"], limit=500)
         dense_documents = [
@@ -518,8 +831,6 @@ class CandidateModel:
         ]
         self._fit_dense(items, dense_documents)
 
-        # История намеренно точная: совпадение query + location редко, но является
-        # высокоточным сигналом и поэтому получает первые позиции.
         item_position = {
             item_id: position for position, item_id in enumerate(self.item_ids)
         }
@@ -546,12 +857,7 @@ class CandidateModel:
                 ["normalized_query", "search_location_id"], sort=False
             )
         }
-
-        # Число отзывов используется только как очень слабый tie-breaker.
-        reviews = items["item_rating_reviews_count"].fillna(0).clip(lower=0)
-        self.quality = np.log1p(reviews.to_numpy(dtype=np.float32))
-        if self.quality.max() > 0:
-            self.quality /= self.quality.max()
+        self.quality = self._build_quality_prior(normalized_train, items)
 
         self.is_fitted = True
         return self
@@ -559,150 +865,186 @@ class CandidateModel:
     def _apply_microcat_boost(
         self,
         fused_scores: np.ndarray,
-        predicted_microcats: list[int],
+        predicted_microcats: list[tuple[int, float]],
     ) -> None:
-        """Мягко усилить кандидатов предсказанных микрокатегорий.
+        """Мягко усилить объявления вероятных микрокатегорий.
 
         Args:
             fused_scores: RRF-оценки, изменяемые на месте.
-            predicted_microcats: До трёх `item_microcat_id` по убыванию
-                уверенности.
+            predicted_microcats: Пары `(microcat, probability)`.
 
         Returns:
             `None`.
         """
-        # Множители, а не жёсткий фильтр: ошибочная микрокатегория не должна
-        # полностью удалить релевантное объявление из другой категории.
-        for microcat, multiplier in zip(
-            predicted_microcats, (1.45, 1.25, 1.10)
-        ):
+        for microcat, probability in predicted_microcats:
             positions = self.microcat_positions.get(microcat)
             if positions is not None:
-                fused_scores[positions] *= multiplier
+                # Мягкий boost сохраняет шанс исправить ошибку microcat-модели.
+                fused_scores[positions] *= 1.0 + 0.70 * probability
+
+    def _geo_quota(
+        self,
+        location: int,
+        predicted_microcats: list[tuple[int, float]],
+    ) -> int:
+        """Рассчитать адаптивную квоту объявлений в ближайшем радиусе.
+
+        Args:
+            location: `search_location_id` запроса.
+            predicted_microcats: Вероятные микрокатегории запроса.
+
+        Returns:
+            Число мест, зарезервированных для geo-пула.
+        """
+        location_rate = float(
+            self.location_near_rate.get(location, self.global_near_rate)
+        )
+        if predicted_microcats:
+            microcat_rate = sum(
+                probability
+                * float(
+                    self.microcat_near_rate.get(microcat, self.global_near_rate)
+                )
+                for microcat, probability in predicted_microcats
+            )
+        else:
+            microcat_rate = self.global_near_rate
+
+        near_probability = 0.65 * location_rate + 0.35 * microcat_rate
+        quota = int(round(self.result_max_size * near_probability))
+        return int(np.clip(quota, self.geo_min_quota, self.geo_max_quota))
 
     def _select_with_quotas(
         self,
         fused_scores: np.ndarray,
         normalized_query: str,
         location: int,
+        predicted_microcats: list[tuple[int, float]],
+        geo_positions: np.ndarray,
     ) -> list[int]:
-        """Выбрать финальные позиции с квотами локации и услуг.
+        """Выбрать 50 сервисных кандидатов с geo- и microcat-покрытием.
 
         Args:
-            fused_scores: Общие RRF-оценки всех объявлений.
-            normalized_query: Нормализованный запрос для поиска истории.
+            fused_scores: Общие оценки всех объявлений.
+            normalized_query: Нормализованный запрос для точной истории.
             location: `search_location_id`.
+            predicted_microcats: Вероятные микрокатегории запроса.
+            geo_positions: Сервисные объявления в адаптивном радиусе.
 
         Returns:
-            До `result_max_size` уникальных позиций корпуса.
+            Ровно `result_max_size` уникальных позиций корпуса.
         """
-        history = list(
-            dict.fromkeys(
-                self.history_map.get((normalized_query, location), [])[
-                    : self.history_limit
-                ]
-            )
-        )
-        # Даже точная история подчиняется страховочной квоте: сначала сохраняем
-        # клики по услугам, затем не более двух редких кликов из других категорий.
-        non_service_limit = self.result_max_size - self.service_quota
+        history = self.history_map.get((normalized_query, location), [])
         selected = [
             position
             for position in history
             if self.categories[position] == self.service_category_id
-        ]
-        selected.extend(
-            position
-            for position in history
-            if self.categories[position] != self.service_category_id
-        )
-        selected = selected[: self.history_limit]
-        if non_service_limit < self.history_limit:
-            service_history = [
-                position
-                for position in selected
-                if self.categories[position] == self.service_category_id
-            ]
-            other_history = [
-                position
-                for position in selected
-                if self.categories[position] != self.service_category_id
-            ][:non_service_limit]
-            selected = service_history + other_history
+        ][: self.history_limit]
+        selected = list(dict.fromkeys(selected))
         selected_set = set(selected)
+        geo_set = set(int(position) for position in geo_positions)
 
-        def add_ranked(pool: np.ndarray, target_count: int, kind: str) -> None:
-            """Добавить лучшие позиции пула до достижения заданной квоты.
+        def add_count(pool: np.ndarray, count: int) -> None:
+            """Добавить заданное число лучших ещё не выбранных позиций.
 
             Args:
-                pool: Допустимые позиции объявлений в корпусе.
-                target_count: Требуемое число кандидатов выбранного типа.
-                kind: Тип счётчика: `local`, `service` или `all`.
+                pool: Допустимые позиции объявлений.
+                count: Максимум новых позиций.
 
             Returns:
                 `None`. Список `selected` изменяется на месте.
             """
-            if len(pool) == 0 or len(selected) >= self.result_max_size:
+            if count <= 0 or len(pool) == 0:
                 return
-
             ranked = pool[
                 self._top_indices(
                     fused_scores[pool],
-                    min(len(pool), max(self.channel_candidates, 200)),
+                    min(len(pool), max(self.channel_candidates, 250)),
                 )
             ]
+            added = 0
             for position in ranked:
                 position = int(position)
                 if position in selected_set:
                     continue
                 selected.append(position)
                 selected_set.add(position)
-
-                if kind == "local":
-                    current_count = sum(
-                        self.locations[index] == location for index in selected
-                    )
-                elif kind == "service":
-                    current_count = sum(
-                        self.categories[index] == self.service_category_id
-                        for index in selected
-                    )
-                else:
-                    current_count = len(selected)
-
-                if current_count >= target_count or len(selected) >= self.result_max_size:
+                added += 1
+                if added >= count or len(selected) >= self.result_max_size:
                     break
 
-        local_positions = self.location_positions.get(
-            location, np.empty(0, dtype=np.int64)
+        geo_target = min(
+            self._geo_quota(location, predicted_microcats), len(geo_positions)
         )
-        local_target = min(self.local_quota, len(local_positions))
+        current_geo = sum(position in geo_set for position in selected)
+        remaining_geo = max(0, geo_target - current_geo)
 
-        # В train локация выбранного объявления совпадает с запросом примерно в 83%
-        # случаев. Сначала набираем локальные услуги. Если их мало, локальная квота
-        # может быть недобрана: категория услуг статистически является более сильным
-        # сигналом, поэтому она имеет приоритет над локальностью.
-        local_service_positions = local_positions[
-            self.categories[local_positions] == self.service_category_id
-        ]
-        add_ranked(local_service_positions, local_target, "local")
+        # Сначала распределяем geo-квоту между вероятными микрокатегориями.
+        # Минимум одно место не позволяет редкому второму интенту исчезнуть.
+        for microcat, probability in predicted_microcats:
+            if remaining_geo <= 0 or len(selected) >= self.result_max_size:
+                break
+            microcat_positions = self.microcat_positions.get(
+                microcat, np.empty(0, dtype=np.int64)
+            )
+            pool = np.intersect1d(
+                geo_positions, microcat_positions, assume_unique=True
+            )
+            requested = min(
+                remaining_geo,
+                max(1, int(round(geo_target * probability))),
+            )
+            before = len(selected)
+            add_count(pool, requested)
+            added = len(selected) - before
+            remaining_geo -= added
 
-        # 497658 из 497673 положительных train-строк относятся к категории 114.
-        # Квота 48/50 удаляет категориальный шум, но оставляет два fallback-места
-        # для редких исключений вместо опасного жёсткого фильтра.
-        service_target = min(self.service_quota, len(self.service_positions))
-        add_ranked(self.service_positions, service_target, "service")
+        if remaining_geo > 0:
+            add_count(geo_positions, remaining_geo)
 
-        # После выполнения сервисной квоты свободные fallback-места сначала отдаём
-        # локальным объявлениям, даже если они относятся к редкой другой категории.
-        add_ranked(local_positions, local_target, "local")
+        # После geo-пула оставляем минимум три места глобальному текстовому
+        # поиску: это страховка для удалённых услуг и ошибки microcat-прогноза.
+        intent_budget = max(0, self.result_max_size - len(selected) - 3)
+        if intent_budget > 0 and predicted_microcats:
+            intent_positions = np.concatenate(
+                [
+                    self.microcat_positions.get(
+                        microcat, np.empty(0, dtype=np.int64)
+                    )
+                    for microcat, _ in predicted_microcats
+                ]
+            )
+            intent_positions = intent_positions[
+                self.categories[intent_positions] == self.service_category_id
+            ]
+            add_count(np.unique(intent_positions), intent_budget)
 
-        all_positions = np.arange(len(self.item_ids), dtype=np.int64)
-        add_ranked(all_positions, self.result_max_size, "all")
+        add_count(
+            self.service_positions,
+            self.result_max_size - len(selected),
+        )
         return selected[: self.result_max_size]
 
+    @staticmethod
+    def _binary_query_matrix(
+        vectorizer: CountVectorizer,
+        texts: list[str],
+    ) -> csr_matrix:
+        """Преобразовать запросы в бинарную матрицу для BM25-документов.
+
+        Args:
+            vectorizer: Обученный словарь соответствующего поля.
+            texts: Нормализованные тексты запросов.
+
+        Returns:
+            Бинарная CSR-матрица запросов.
+        """
+        matrix = vectorizer.transform(texts).tocsr()
+        matrix.data.fill(1.0)
+        return matrix
+
     def predict(self, queries: pd.DataFrame) -> list[list[str]]:
-        """Найти до 50 кандидатов для каждого запроса.
+        """Найти 50 кандидатов для каждого benchmark-запроса.
 
         Args:
             queries: Benchmark-запросы в исходном порядке.
@@ -711,8 +1053,8 @@ class CandidateModel:
             Список списков `item_id`; порядок совпадает с `queries`.
 
         Raises:
-            RuntimeError: Если `fit()` ещё не вызван.
-            ValueError: Если нет обязательных колонок.
+            RuntimeError: Если `fit()` ещё не вызван или top-50 некорректен.
+            ValueError: Если в запросах отсутствуют обязательные колонки.
         """
         if not self.is_fitted:
             raise RuntimeError("Сначала вызовите CandidateModel.fit()")
@@ -728,24 +1070,31 @@ class CandidateModel:
         )
 
         query = Normalizer.lexical(queries["search_query"])
-        filters = Normalizer.lexical(
-            queries["search_infm_params_text"], limit=500
-        )
-        predicted_microcats = self._predict_microcats(query)
-        lexical_queries = [
-            f"{query_text} {query_text} {query_filters}"
-            for query_text, query_filters in zip(query, filters)
+        filters = Normalizer.lexical(queries["search_infm_params_text"])
+        predicted_microcats = self._predict_microcats(query, filters)
+        query_texts = query.tolist()
+        params_queries = [
+            f"{query_text} {query_filter}".strip()
+            for query_text, query_filter in zip(query, filters)
+        ]
+        char_queries = [
+            f"{query_text} {query_text} {query_filter}".strip()
+            for query_text, query_filter in zip(query, filters)
         ]
 
-        query_bm25 = self.bm25_vectorizer.transform(lexical_queries).tocsr()
-        # BM25 учитывает наличие терма в коротком запросе, а не число его повторов.
-        query_bm25.data.fill(1.0)
-        query_chars = self.char_vectorizer.transform(lexical_queries)
+        title_query = self._binary_query_matrix(
+            self.title_vectorizer, query_texts
+        )
+        description_query = self._binary_query_matrix(
+            self.description_vectorizer, query_texts
+        )
+        params_query = self._binary_query_matrix(
+            self.params_vectorizer, params_queries
+        )
+        char_query = self.char_vectorizer.transform(char_queries)
 
         dense_query = Normalizer.dense(queries["search_query"])
-        dense_filters = Normalizer.dense(
-            queries["search_infm_params_text"], limit=500
-        )
+        dense_filters = Normalizer.dense(queries["search_infm_params_text"], limit=500)
         dense_queries = [
             ". ".join(part for part in parts if part)
             for parts in zip(dense_query, dense_filters)
@@ -763,52 +1112,51 @@ class CandidateModel:
 
         for start in range(0, len(queries), inference_batch_size):
             stop = min(start + inference_batch_size, len(queries))
-            bm25_scores = (
-                query_bm25[start:stop] @ self.item_bm25.T
+            title_scores = (
+                title_query[start:stop] @ self.item_title_bm25.T
+            ).toarray()
+            description_scores = (
+                description_query[start:stop] @ self.item_description_bm25.T
+            ).toarray()
+            params_scores = (
+                params_query[start:stop] @ self.item_params_bm25.T
             ).toarray()
             char_scores = (
-                query_chars[start:stop] @ self.item_chars.T
+                char_query[start:stop] @ self.item_chars.T
             ).toarray()
-            dense_scores = (
-                query_embeddings[start:stop] @ self.item_embeddings.T
-            )
+            dense_scores = query_embeddings[start:stop] @ self.item_embeddings.T
 
             for offset in range(stop - start):
                 query_index = start + offset
-                fused = 1e-8 * self.quality.copy()
+                fused = self.quality_weight * self.quality.copy()
                 channel_scores = (
-                    (bm25_scores[offset], 1.0),
-                    (char_scores[offset], 0.8),
-                    (dense_scores[offset], 1.2),
+                    (title_scores[offset], 1.20),
+                    (description_scores[offset], 0.90),
+                    (params_scores[offset], 1.00),
+                    (char_scores[offset], 0.80),
+                    (dense_scores[offset], 1.20),
                 )
 
-                # Глобальные списки не дают локальной эвристике удалить исполнителей,
-                # работающих удалённо или обслуживающих соседние локации.
                 for scores, weight in channel_scores:
-                    ranked = self._top_indices(
-                        scores, self.channel_candidates
-                    )
+                    ranked = self._top_indices(scores, self.channel_candidates)
                     self._add_rrf(fused, ranked, weight)
 
                 row = queries.iloc[query_index]
                 location = int(row["search_location_id"])
-                local_positions = self.location_positions.get(
-                    location, np.empty(0, dtype=np.int64)
-                )
-
-                # Для delivery-запроса локальность не усиливается. Сейчас все benchmark-
-                # запросы имеют delivery=0, но ветка оставлена для общей корректности.
+                geo_positions = np.empty(0, dtype=np.int64)
                 if not bool(row["search_is_delivery_search"]):
+                    geo_positions, proximity = self._geo_candidates(location)
                     for scores, weight in channel_scores:
-                        local_rank = self._top_indices(
-                            scores[local_positions],
-                            min(self.channel_candidates, len(local_positions)),
+                        geo_rank = self._top_indices(
+                            scores[geo_positions],
+                            min(self.channel_candidates, len(geo_positions)),
                         )
                         self._add_rrf(
                             fused,
-                            local_positions[local_rank],
-                            0.6 * weight,
+                            geo_positions[geo_rank],
+                            0.70 * weight,
                         )
+                    fused[geo_positions] += self.geo_weight * proximity
 
                 self._apply_microcat_boost(
                     fused, predicted_microcats[query_index]
@@ -817,11 +1165,20 @@ class CandidateModel:
                     fused,
                     normalized_query=str(query[query_index]),
                     location=location,
+                    predicted_microcats=predicted_microcats[query_index],
+                    geo_positions=geo_positions,
                 )
 
-                expected_size = min(self.result_max_size, len(self.item_ids))
-                if len(selected) != expected_size or len(selected) != len(set(selected)):
-                    raise RuntimeError("Не удалось сформировать уникальный top-N")
+                if (
+                    len(selected) != self.result_max_size
+                    or len(selected) != len(set(selected))
+                    or np.any(
+                        self.categories[selected] != self.service_category_id
+                    )
+                ):
+                    raise RuntimeError(
+                        "Не удалось сформировать 50 уникальных объявлений услуг"
+                    )
                 predictions.append(self.item_ids[selected].tolist())
 
             LOGGER.info("Обработано запросов: %d/%d", stop, len(queries))
