@@ -1,9 +1,10 @@
-"""Гибридная кандидатогенерация V3 для поиска услуг Авито.
+"""Гибридная кандидатогенерация V4 для поиска услуг Авито.
 
 Версия объединяет пять независимых текстовых каналов, географический
-поиск по координатам, статистику query/filter -> microcat и слабые признаки
-качества объявления. Финальные 50 кандидатов выбираются с квотами, потому
-что Recall@50 зависит от покрытия, а не от порядка внутри ответа.
+поиск по координатам, статистику query/filter -> microcat, query profile по
+историческим кликам и точное совпадение поисковых фильтров с параметрами.
+Финальные 50 кандидатов выбираются с квотами, потому что Recall@50 зависит
+от покрытия, а не от порядка внутри ответа.
 
 MiniLM не дообучается. `fit()` строит разреженные индексы, статистику
 кликов и географические центры; эмбеддинги объявлений кешируются на диске.
@@ -87,6 +88,8 @@ class CandidateModel:
         history_limit: int = 8,
         geo_min_quota: int = 32,
         geo_max_quota: int = 45,
+        filter_quota: int = 10,
+        profile_quota: int = 6,
         quality_weight: float = 0.002,
         geo_weight: float = 0.001,
     ) -> None:
@@ -103,6 +106,8 @@ class CandidateModel:
             history_limit: Максимум точных исторических кандидатов.
             geo_min_quota: Минимальная квота географически близких объявлений.
             geo_max_quota: Максимальная квота географически близких объявлений.
+            filter_quota: Квота объявлений с полным совпадением фильтра.
+            profile_quota: Квота кандидатов query-profile канала.
             quality_weight: Вес сглаженного prior качества объявления.
             geo_weight: Дополнительный вес близости внутри geo-пула.
 
@@ -115,6 +120,10 @@ class CandidateModel:
             )
         if result_max_size <= 0:
             raise ValueError("result_max_size должен быть положительным")
+        if not 0 <= filter_quota <= result_max_size:
+            raise ValueError("filter_quota должна быть в диапазоне результата")
+        if not 0 <= profile_quota <= result_max_size:
+            raise ValueError("profile_quota должна быть в диапазоне результата")
 
         self.model_name_or_path = model_name_or_path
         self.artifacts_dir = Path(artifacts_dir)
@@ -126,6 +135,8 @@ class CandidateModel:
         self.history_limit = history_limit
         self.geo_min_quota = geo_min_quota
         self.geo_max_quota = geo_max_quota
+        self.filter_quota = filter_quota
+        self.profile_quota = profile_quota
         self.quality_weight = quality_weight
         self.geo_weight = geo_weight
         self.is_fitted = False
@@ -323,6 +334,52 @@ class CandidateModel:
             self.reference_queries
         )
 
+    def _fit_query_profiles(
+        self,
+        normalized_train: pd.DataFrame,
+        raw_train: pd.DataFrame,
+    ) -> None:
+        """Собрать текстовые профили запросов из исторически выбранных объявлений.
+
+        Args:
+            normalized_train: Train с колонкой `normalized_query`.
+            raw_train: Исходный train с текстами объявлений.
+
+        Returns:
+            `None`. Создаёт профиль каждого train-запроса и массив в порядке
+            `reference_queries`.
+        """
+        pair_counts = (
+            normalized_train.groupby(["normalized_query", "item_id"], sort=False)
+            .size()
+            .rename("clicks")
+            .reset_index()
+            .sort_values(
+                ["normalized_query", "clicks"], ascending=[True, False]
+            )
+            .groupby("normalized_query", sort=False)
+            .head(3)
+        )
+        item_texts = raw_train[
+            ["item_id", "item_title_raw", "item_infm_params_text"]
+        ].drop_duplicates("item_id")
+        profiles = pair_counts.merge(item_texts, on="item_id", how="left")
+        titles = Normalizer.dense(profiles["item_title_raw"])
+        params = Normalizer.dense(profiles["item_infm_params_text"], limit=180)
+        profiles["profile_part"] = [
+            ". ".join(part for part in parts if part)
+            for parts in zip(titles, params)
+        ]
+        self.query_profiles = (
+            profiles.groupby("normalized_query", sort=False)["profile_part"]
+            .agg(". ".join)
+            .to_dict()
+        )
+        self.reference_profiles = np.asarray(
+            [self.query_profiles.get(str(query), "") for query in self.reference_queries],
+            dtype=object,
+        )
+
     @staticmethod
     def _add_probability_evidence(
         scores: defaultdict[int, float],
@@ -349,18 +406,19 @@ class CandidateModel:
         self,
         query_texts: np.ndarray,
         filter_texts: np.ndarray,
-    ) -> list[list[tuple[int, float]]]:
-        """Предсказать до пяти микрокатегорий по запросу и фильтрам.
+    ) -> tuple[list[list[tuple[int, float]]], list[str]]:
+        """Предсказать микрокатегории и построить query-profile тексты.
 
         Args:
             query_texts: Нормализованные benchmark-запросы.
             filter_texts: Нормализованные поисковые фильтры.
 
         Returns:
-            Для каждого запроса список `(microcat, probability)`.
+            Списки `(microcat, probability)` и тексты query profile.
         """
         query_matrix = self.query_vectorizer.transform(query_texts)
         predictions: list[list[tuple[int, float]]] = []
+        profile_queries: list[str] = []
 
         for start in range(0, len(query_texts), 64):
             stop = min(start + 64, len(query_texts))
@@ -374,6 +432,7 @@ class CandidateModel:
                 similarities,
             ):
                 scores: defaultdict[int, float] = defaultdict(float)
+                neighbours = np.empty(0, dtype=np.int64)
 
                 exact_pair = self.query_filter_microcats.get(
                     (str(query), str(query_filter))
@@ -411,7 +470,24 @@ class CandidateModel:
                     else []
                 )
 
-        return predictions
+                # Для известного запроса используем его клики. Для нового —
+                # профиль ближайшего train-запроса, но только при ненулевой
+                # char-схожести. Исходный запрос остаётся первым и защищает от
+                # полного дрейфа к соседнему интенту.
+                profile = self.query_profiles.get(str(query), "")
+                if not profile:
+                    for neighbour in neighbours:
+                        if float(row[neighbour]) <= 0:
+                            break
+                        candidate_profile = str(self.reference_profiles[neighbour])
+                        if candidate_profile:
+                            profile = candidate_profile
+                            break
+                profile_queries.append(
+                    f"{query}. {profile}" if profile else ""
+                )
+
+        return predictions, profile_queries
 
     @staticmethod
     def _haversine_km(
@@ -545,6 +621,47 @@ class CandidateModel:
         proximity = np.exp(-distances[positions] / 25.0).astype(np.float32)
         result = (positions, proximity)
         self.geo_cache[location] = result
+        return result
+
+    def _filter_candidates(self, filter_text: str) -> np.ndarray:
+        """Найти объявления со всеми значимыми словами поискового фильтра.
+
+        Args:
+            filter_text: Нормализованный `search_infm_params_text`.
+
+        Returns:
+            Позиции сервисных объявлений с полным token coverage. Пустой
+            массив означает, что фильтр пуст, слишком общий или содержит
+            неизвестные корпусу значения.
+        """
+        cached = self.filter_cache.get(filter_text)
+        if cached is not None:
+            return cached
+
+        stop_words = {"вид", "тип", "услуга", "услуги", "услуг"}
+        analyzer = self.params_vectorizer.build_analyzer()
+        tokens = sorted(
+            {
+                token
+                for token in analyzer(filter_text)
+                if token not in stop_words
+            }
+        )
+        vocabulary = self.params_vectorizer.vocabulary_
+        if not tokens or any(token not in vocabulary for token in tokens):
+            result = np.empty(0, dtype=np.int64)
+            self.filter_cache[filter_text] = result
+            return result
+
+        columns = [vocabulary[token] for token in tokens]
+        matched_terms = np.asarray(
+            self.item_params_bm25[:, columns].getnnz(axis=1)
+        ).ravel()
+        result = np.flatnonzero(
+            (matched_terms == len(columns))
+            & (self.categories == self.service_category_id)
+        )
+        self.filter_cache[filter_text] = result
         return result
 
     def _embedding_fingerprint(
@@ -705,6 +822,8 @@ class CandidateModel:
                 "search_location_id",
                 "search_infm_params_text",
                 "item_id",
+                "item_title_raw",
+                "item_infm_params_text",
                 "item_microcat_id",
                 "item_latitude",
                 "item_longitude",
@@ -781,6 +900,7 @@ class CandidateModel:
             normalized_train["search_infm_params_text"]
         )
         self._fit_query_knowledge(normalized_train)
+        self._fit_query_profiles(normalized_train, train)
         self._fit_geography(normalized_train)
 
         title = Normalizer.lexical(items["item_title_raw"])
@@ -799,6 +919,7 @@ class CandidateModel:
         self.params_vectorizer, self.item_params_bm25 = self._build_bm25(
             params.tolist(), ngram_range=(1, 1), max_features=100_000
         )
+        self.filter_cache: dict[str, np.ndarray] = {}
 
         # Char TF-IDF оставляем в проверенном компактном виде baseline. Полный
         # params уже представлен отдельным BM25-каналом, поэтому повторно
@@ -821,7 +942,7 @@ class CandidateModel:
         )
         del title, char_params
 
-        # Dense-текст совпадает с версией 0.658719, поэтому существующий кеш
+        # Dense-текст корпуса совпадает с V3, поэтому существующий кеш
         # MiniLM переиспользуется и повторный расчёт эмбеддингов не требуется.
         dense_title = Normalizer.dense(items["item_title_raw"])
         dense_params = Normalizer.dense(items["item_infm_params_text"], limit=500)
@@ -921,8 +1042,10 @@ class CandidateModel:
         location: int,
         predicted_microcats: list[tuple[int, float]],
         geo_positions: np.ndarray,
+        filter_positions: np.ndarray,
+        profile_positions: np.ndarray,
     ) -> list[int]:
-        """Выбрать 50 сервисных кандидатов с geo- и microcat-покрытием.
+        """Выбрать 50 кандидатов с geo-, filter- и profile-покрытием.
 
         Args:
             fused_scores: Общие оценки всех объявлений.
@@ -930,6 +1053,8 @@ class CandidateModel:
             location: `search_location_id`.
             predicted_microcats: Вероятные микрокатегории запроса.
             geo_positions: Сервисные объявления в адаптивном радиусе.
+            filter_positions: Объявления с полным token coverage фильтра.
+            profile_positions: Лучшие кандидаты query-profile канала.
 
         Returns:
             Ровно `result_max_size` уникальных позиций корпуса.
@@ -943,6 +1068,8 @@ class CandidateModel:
         selected = list(dict.fromkeys(selected))
         selected_set = set(selected)
         geo_set = set(int(position) for position in geo_positions)
+        filter_set = set(int(position) for position in filter_positions)
+        profile_set = set(int(position) for position in profile_positions)
 
         def add_count(pool: np.ndarray, count: int) -> None:
             """Добавить заданное число лучших ещё не выбранных позиций.
@@ -973,6 +1100,25 @@ class CandidateModel:
                 if added >= count or len(selected) >= self.result_max_size:
                     break
 
+        # Новые каналы сначала получают места внутри geo-пула: так точный
+        # фильтр или click-profile не вытесняет локальных исполнителей.
+        filter_geo = np.intersect1d(
+            geo_positions, filter_positions, assume_unique=True
+        )
+        profile_geo = np.intersect1d(
+            geo_positions, profile_positions, assume_unique=True
+        )
+        current_filter = sum(position in filter_set for position in selected)
+        add_count(
+            filter_geo,
+            max(0, min(self.filter_quota, 7) - current_filter),
+        )
+        current_profile = sum(position in profile_set for position in selected)
+        add_count(
+            profile_geo,
+            max(0, min(self.profile_quota, 4) - current_profile),
+        )
+
         geo_target = min(
             self._geo_quota(location, predicted_microcats), len(geo_positions)
         )
@@ -1001,6 +1147,21 @@ class CandidateModel:
 
         if remaining_geo > 0:
             add_count(geo_positions, remaining_geo)
+
+        # Добираем глобальную часть filter/profile квот, но сохраняем три
+        # fallback-места для независимого текстового поиска.
+        available = max(0, self.result_max_size - len(selected) - 3)
+        current_filter = sum(position in filter_set for position in selected)
+        add_count(
+            filter_positions,
+            min(available, max(0, self.filter_quota - current_filter)),
+        )
+        available = max(0, self.result_max_size - len(selected) - 3)
+        current_profile = sum(position in profile_set for position in selected)
+        add_count(
+            profile_positions,
+            min(available, max(0, self.profile_quota - current_profile)),
+        )
 
         # После geo-пула оставляем минимум три места глобальному текстовому
         # поиску: это страховка для удалённых услуг и ошибки microcat-прогноза.
@@ -1071,7 +1232,9 @@ class CandidateModel:
 
         query = Normalizer.lexical(queries["search_query"])
         filters = Normalizer.lexical(queries["search_infm_params_text"])
-        predicted_microcats = self._predict_microcats(query, filters)
+        predicted_microcats, profile_queries = self._predict_microcats(
+            query, filters
+        )
         query_texts = query.tolist()
         params_queries = [
             f"{query_text} {query_filter}".strip()
@@ -1106,6 +1269,15 @@ class CandidateModel:
             convert_to_numpy=True,
             show_progress_bar=True,
         ).astype(np.float32)
+        profile_embeddings = self.encoder.encode(
+            profile_queries,
+            batch_size=self.embedding_batch_size,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=True,
+        ).astype(np.float32)
+        has_profile = np.asarray([bool(text) for text in profile_queries])
+        profile_embeddings[~has_profile] = 0.0
 
         predictions: list[list[str]] = []
         inference_batch_size = 16
@@ -1125,17 +1297,22 @@ class CandidateModel:
                 char_query[start:stop] @ self.item_chars.T
             ).toarray()
             dense_scores = query_embeddings[start:stop] @ self.item_embeddings.T
+            profile_scores = (
+                profile_embeddings[start:stop] @ self.item_embeddings.T
+            )
 
             for offset in range(stop - start):
                 query_index = start + offset
                 fused = self.quality_weight * self.quality.copy()
-                channel_scores = (
+                channel_scores: tuple[tuple[np.ndarray, float], ...] = (
                     (title_scores[offset], 1.20),
                     (description_scores[offset], 0.90),
                     (params_scores[offset], 1.00),
                     (char_scores[offset], 0.80),
                     (dense_scores[offset], 1.20),
                 )
+                if has_profile[query_index]:
+                    channel_scores += ((profile_scores[offset], 1.00),)
 
                 for scores, weight in channel_scores:
                     ranked = self._top_indices(scores, self.channel_candidates)
@@ -1143,6 +1320,34 @@ class CandidateModel:
 
                 row = queries.iloc[query_index]
                 location = int(row["search_location_id"])
+                filter_positions = self._filter_candidates(
+                    str(filters[query_index])
+                )
+                if has_profile[query_index]:
+                    profile_positions = self._top_indices(
+                        profile_scores[offset], self.channel_candidates
+                    )
+                    profile_positions = profile_positions[
+                        self.categories[profile_positions]
+                        == self.service_category_id
+                    ]
+                else:
+                    profile_positions = np.empty(0, dtype=np.int64)
+
+                # Внутри exact-filter пула повторно объединяем каналы. Иначе
+                # при широком фильтре квота выбирала бы объявления почти только
+                # по популярности, а не по тексту запроса.
+                for scores, weight in channel_scores:
+                    filter_rank = self._top_indices(
+                        scores[filter_positions],
+                        min(self.channel_candidates, len(filter_positions)),
+                    )
+                    self._add_rrf(
+                        fused,
+                        filter_positions[filter_rank],
+                        0.40 * weight,
+                    )
+
                 geo_positions = np.empty(0, dtype=np.int64)
                 if not bool(row["search_is_delivery_search"]):
                     geo_positions, proximity = self._geo_candidates(location)
@@ -1167,6 +1372,8 @@ class CandidateModel:
                     location=location,
                     predicted_microcats=predicted_microcats[query_index],
                     geo_positions=geo_positions,
+                    filter_positions=filter_positions,
+                    profile_positions=profile_positions,
                 )
 
                 if (
